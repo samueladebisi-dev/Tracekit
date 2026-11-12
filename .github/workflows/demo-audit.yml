@@ -1,0 +1,35 @@
+name: demo audit (fork only)
+on:
+  pull_request:
+jobs:
+  demo:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q -e .
+      - name: a home with Gemini CLI sessions only
+        run: |
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          c="$RUNNER_TEMP/home/.gemini/tmp/myproj/chats"
+          mkdir -p "$c/s-1111"
+          m1='{"id":"m1","timestamp":"'$now'","type":"gemini","content":"","toolCalls":[{"id":"c1","name":"run_shell_command","args":{"command":"rm -rf /"},"status":"executing","timestamp":"'$now'"}]}'
+          {
+            echo '{"sessionId":"s-1111","projectHash":"h","startTime":"'$now'"}'
+            echo "$m1"
+            echo "${m1/executing/error}"
+            echo '{"id":"m2","timestamp":"'$now'","type":"gemini","content":"","toolCalls":[{"id":"c2","name":"run_shell_command","args":{"command":"terraform destroy -auto-approve"},"status":"success","timestamp":"'$now'"}]}'
+            echo '{"$rewindTo":"m2"}'
+            echo 'not json'
+          } > "$c/session-2026-11-12T10-00-s-1111.jsonl"
+          echo '{"sessionId":"sub","kind":"subagent"}' > "$c/s-1111/sub.jsonl"
+          echo '{"id":"m1","timestamp":"'$now'","type":"gemini","content":"","toolCalls":[{"id":"c1","name":"read_file","args":{"file_path":"README.md"},"status":"success","timestamp":"'$now'"}]}' >> "$c/s-1111/sub.jsonl"
+          echo '{"sessionId":"s-0","messages":[{"id":"m1","type":"gemini","timestamp":"'$now'","toolCalls":[{"id":"c1","name":"write_file","args":{"file_path":".env","content":"KEY=1"},"status":"success","timestamp":"'$now'"}]}]}' > "$c/session-2026-10-30T09-00-s-0.json"
+          echo '{"x":1}' > "$c/../logs.json"
+          HOME="$RUNNER_TEMP/home" tracekit audit --all
+          HOME="$RUNNER_TEMP/home" tracekit audit --share
+          tracekit audit "$RUNNER_TEMP/home/.gemini/tmp" --agent gemini --since 1h --json | jq -c '{agents, counts, skipped_malformed, sessions}'
+          GEMINI_CLI_HOME="$RUNNER_TEMP/home" HOME="$RUNNER_TEMP/empty" tracekit audit | grep '^read:'
+          tracekit audit . --agent opencode || echo "exit $?"
