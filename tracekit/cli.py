@@ -454,8 +454,8 @@ def _parser():
                        "calls, holds, denies and flags by rule, gaps, integrity (--since, --json, --share)",
                        add_help=False)
     p.add_argument("rest", nargs=argparse.REMAINDER)
-    p = sub.add_parser("audit", help="replay your coding agents' past tool calls (Claude Code transcripts, or a calls file) "
-                       "through the policy and count what it would have held or denied; read-only, not a signed record", add_help=False)
+    p = sub.add_parser("audit", help="replay your coding agents' past tool calls (Claude Code and Cursor transcripts, Cline tasks, "
+                       "Gemini CLI sessions, or a calls file) through the policy and count what it would have held or denied; read-only, not a signed record", add_help=False)
     p.add_argument("rest", nargs=argparse.REMAINDER)
     p = sub.add_parser("tips", help="what each step of your coding agents cost and how to cut it, as tracekit view's "
                        "TIPS page says it, from the dev signer's store and Claude Code's transcripts (--since, --json)",
@@ -662,6 +662,13 @@ def _match_pending(pend, prefix):
 
 
 def _run(a):
+    if a.cmd in ("init", "uninstall") and a.agent == "gptme":
+        if a.project:
+            print("tracekit: gptme hooks use the user's config; omit --project", file=sys.stderr)
+            return 2
+        if a.cmd == "init" and not (a.dev or a.remote):
+            print("tracekit: gptme hooks support per-user --dev installs", file=sys.stderr)
+            return 2
     if a.cmd == "init" and a.remote:
         return _init_remote(a)
     if a.cmd == "init":
@@ -1373,6 +1380,12 @@ def _last(a):
         elif agent == "claude-code":
             why = ("still open: it finishes when the session ends (`/exit` in Claude Code) "
                    "or after the signer's idle timeout; tracekit last --open verifies it as it stands")
+        elif agent in ("opencode", "kilo", "goose", "antigravity"):   # their hooks get no session end
+            why = (f"still open: Tracekit's {agent} hooks get no session end, so it finishes after the signer's idle "
+                   "timeout; tracekit last --open verifies it as it stands")
+        elif agent == "cline":   # a run is one task (agent_hooks: TaskComplete ends it)
+            why = ("still open: it finishes when the Cline task completes, or after the signer's idle timeout (a "
+                   "cancelled task sends no hook); tracekit last --open verifies it as it stands")
         elif agent in agent_hooks.AGENT_NAMES.values():
             why = ("still open: it finishes when the session ends "
                    "or after the signer's idle timeout; tracekit last --open verifies it as it stands")
