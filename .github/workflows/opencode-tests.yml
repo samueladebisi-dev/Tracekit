@@ -1,0 +1,14 @@
+name: opencode tests (fork only)
+on:
+  pull_request:
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q -e . pytest pyflakes
+      - run: python -m pyflakes tracekit tests
+      - run: python -m pytest tests/test_audit.py -q -p no:cacheprovider
