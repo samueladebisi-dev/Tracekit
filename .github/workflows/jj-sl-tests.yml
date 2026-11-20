@@ -1,0 +1,23 @@
+name: jj sl tests (fork only)
+on:
+  pull_request:
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q -e ".[dev]" pyflakes
+      - run: python -m pyflakes tracekit tests
+      - name: Tests
+        run: python -m pytest tests/test_signer_policy.py tests/test_policy_routes.py tests/test_policy2.py -q -p no:cacheprovider
+      - name: Evals
+        run: |
+          for e in e17_policy_corpus e21_policy_robustness e21_robustness; do python "eval/$e.py"; done
+      - name: Result diffs
+        if: always()
+        run: |
+          git status --short
+          git diff -- eval/results
