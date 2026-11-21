@@ -13,6 +13,7 @@ from unittest import mock
 
 import adapter_contract as ac
 import test_said as ts
+from factories import VersionCheckCases
 from tracekit.sdk.client import Client, SignerUnavailable
 from tracekit.testing import FakeSigner
 
@@ -186,6 +187,15 @@ class TestOnRealSigner(ac.Contract, ac.OnReal, unittest.TestCase):
         self.d.options.hooks = cas.tracekit_hooks(down, {**self.d.run(), "fail_modes": {"default": "open"}})
         self.assertEqual(self.d.call("echo", {"text": "hi"}, "call-2")["ran"], ["echo"])
 
+    def test_signer_unreachable_follows_the_fail_mode_of_the_tools_class(self):
+        down = Client(os.path.join(ac.tmpdir(self), "none.sock"))
+        self.addCleanup(down.close)
+        self.d.options.hooks = cas.tracekit_hooks(
+            down, {**self.d.run(), "fail_modes": {"default": "closed", "shell": "open"}})
+        with mock.patch.object(ac, "TOOLS", [*ac.TOOLS, ac.terminal]):   # the stub CLI runs the tools named here
+            self.assertEqual(self.d.call("terminal", {"commands": "ls"}, "call-2")["ran"], ["terminal"])   # class shell
+            self.refused(self.d.call("echo", {"text": "hi"}, "call-3"), "signer unavailable")
+
     def test_a_refusal_blocks_even_when_the_run_fails_open(self):
         self.client.close_run(dict(self.d.run()))
         self.d.options.hooks = cas.tracekit_hooks(self.d.signer, {**self.d.run(), "fail_modes": {"default": "open"}})
@@ -324,6 +334,17 @@ class Said(unittest.TestCase):
         self.signer.model_event = mock.Mock(side_effect=SignerUnavailable("down"))
         with self.assertWarnsRegex(UserWarning, "what the model said was not recorded"):
             self.said(self.MESSAGE)
+
+
+@unittest.skipUnless(HAVE_SDK, "claude-agent-sdk not installed")
+class VersionCheck(VersionCheckCases, unittest.TestCase):
+    module, inside = "claude_agent_sdk", "0.2.165"
+    message = "Claude Agent SDK 0.0.1 is wired but untested; Tracekit is tested with claude-agent-sdk>=0.2.165,<0.3"
+
+    def entries(self, integration):
+        run = {"run_id": "r", "run_token": "t"}
+        return (lambda: integration.tracekit_hooks(mock.Mock(), run),
+                lambda: integration.TracekitSessionStore(mock.Mock(), mock.Mock(), run))
 
 
 if __name__ == "__main__":

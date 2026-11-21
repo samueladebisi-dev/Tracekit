@@ -24,6 +24,7 @@ real library on every push to main and every pull request; each experimental pag
 | LlamaIndex | Experimental | [LlamaIndex](integrations/llamaindex.md) |
 | Haystack | Experimental | [Haystack](integrations/haystack.md) |
 | Microsoft Agent Framework | Experimental | [Microsoft Agent Framework](integrations/microsoft-agent-framework.md) |
+| Inspect AI | Experimental | [Inspect AI](integrations/inspect-ai.md) |
 | Vercel AI SDK (TypeScript) | Experimental | [Vercel AI SDK](integrations/vercel-ai.md), [TypeScript SDK](../sdk/typescript/README.md) |
 
 Another agent: record its calls with the SDK's run handle ([custom agent](quickstarts/custom.md)).
@@ -41,10 +42,18 @@ Another agent: record its calls with the SDK's run handle ([custom agent](quicks
 | Antigravity CLI (`tracekit init --dev --v2 --agent antigravity`) | Experimental | [Antigravity CLI](coding-agents.md#antigravity-cli) |
 | Crush (`tracekit init --dev --v2 --agent crush`) | Experimental | [coding agents](coding-agents.md) |
 | Cline, CLI and VS Code extension (`tracekit init --dev --v2 --agent cline`) | Experimental | [coding agents](coding-agents.md) |
+| gptme 0.36 (`tracekit init --dev --v2 --agent gptme`) | Experimental | [coding agents](coding-agents.md) |
+| OpenHands CLI (`tracekit init --dev --v2 --agent openhands`) | Experimental | [coding agents](coding-agents.md) |
+| GitHub Copilot CLI 1.0.107 or later (`tracekit init --dev --v2 --agent copilot`) | Experimental | [coding agents](coding-agents.md) |
+| CodeBuddy Code (`tracekit init --dev --v2 --agent codebuddy`) | Experimental | [coding agents](coding-agents.md) |
+| jcode (`tracekit init --dev --v2 --agent jcode`) | Experimental | [coding agents](coding-agents.md) |
+| Kiro CLI (`tracekit init --dev --v2 --agent kiro`) | Experimental | [coding agents](coding-agents.md) |
+| Open Interpreter 0.0.61 (`tracekit init --dev --v2 --agent interpreter`) | Experimental | [coding agents](coding-agents.md) |
 | Hermes Agent plugin | Experimental | [Hermes Agent](integrations/hermes.md) |
 
 The goose, Qwen Code, Factory Droid, Antigravity CLI and Crush hooks are written to each harness's published hook
-documentation and tested against payloads in that shape, not yet in a live session of the tool.
+documentation and tested against payloads in that shape, not yet in a live session of the tool. CodeBuddy Code's are
+written to its bundled code (2.183.0), with payloads derived from that code, not yet recorded in a live session.
 
 ## Sandboxes, gateways and sensors
 
@@ -58,7 +67,7 @@ pack. What each one records: [sandboxes, gateways and sensors](concepts/integrat
   [E2B](integrations/e2b.md), [microsandbox](integrations/microsandbox.md),
   [Kubernetes agent-sandbox](integrations/agent-sandbox.md).
 - Agent and MCP gateways: [A2A gateway](a2a.md), [agentgateway](integrations/agentgateway.md), [LiteLLM](integrations/litellm.md),
-  [Docker MCP Gateway](integrations/docker-mcp-gateway.md), [Wassette](integrations/wassette.md).
+  [Docker MCP Gateway](integrations/docker-mcp-gateway.md), [LangSmith Tool Gateway](integrations/langsmith-tool-gateway.md), [Wassette](integrations/wassette.md).
 - Kernel sensors: [Tetragon](integrations/tetragon.md), [Falco](integrations/falco.md).
 
 Tracekit's own [A2A gateway](a2a.md), [MCP gateway](mcp-gateway.md), [LLM gateway](gateway.md), [tool executor](executor.md) and

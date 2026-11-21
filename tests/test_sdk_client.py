@@ -4,10 +4,12 @@ import asyncio
 import collections
 import contextlib
 import datetime
+import http.server
 import io
 import json
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -414,6 +416,234 @@ class Transports(unittest.TestCase):
         self.addCleanup(patch.stop)
         return Client("https://signer.test:8443", timeout=timeout)
 
+    def test_refusals_and_lost_connections_are_counted_apart(self):
+        """Two rate limits and a lost connection are not three lost connections: the signer's refusals that run out
+        are its RPCError, as before retries, not SignerUnavailable (which would apply the fail mode)."""
+        answers, sent = iter([LIMIT, LIMIT, client._ConnectionLost("reset"), LIMIT]), []
+
+        def answer(frame):
+            sent.append(frame)
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+        with self.assertRaises(RPCError) as cm:
+            self.https(answer).decide({**EVENT, "tool_call_id": "c1", "args": {}})
+        self.assertEqual((cm.exception.code, len(sent)), ("quota_exceeded", 4))
+        self.assertEqual(len({(f["request_id"], f["stream"], f["client_seq"]) for f in sent}), 1)   # one request
+
+    def test_a_retry_refused_as_already_recorded_raises_the_first_tries_outage(self):
+        """The try the signer answered unavailable was written after all, so its retry is client_seq_reused: the caller
+        gets that unavailable, its outage path, as without retries. Without an outage before it, the refusal stands."""
+        for answers, code in (([OUTAGE, REUSED], "unavailable"), ([REUSED], "client_seq_reused")):
+            it = iter(answers)
+            with self.subTest(code), self.assertRaises(RPCError) as cm:
+                self.https(lambda f: next(it)).decide({**EVENT, "tool_call_id": "c1", "args": {}})
+            self.assertEqual((cm.exception.code, cm.exception.message), (code, {
+                "unavailable": "storage refused writes", "client_seq_reused": "s/0"}[code]))
+
+    def test_complete_says_whether_its_result_was_recorded(self):
+        """A retry refused client_seq_reused after an outage was recorded: no warning. Three lost connections leave it
+        unknown: "may not have been recorded", and where to look. A refusal was not recorded, as before."""
+        lost = client._ConnectionLost("reset")
+        for answers, warning in (
+                ([OUTAGE, REUSED], None),
+                ([lost] * 3, r"the result of call-1 may not have been recorded \(lost the connection .*\)\. Once the run "
+                             r"closes, its bundle has call-1's tool.result if it was, or a decided_not_completed gap"),
+                ([MISMATCH], r"the result of call-1 was not recorded: args_mismatch: no\. Once the run closes, its "
+                             r"bundle shows call-1 as decided and not completed")):
+            it = iter(answers)
+
+            def answer(frame):
+                a = next(it)
+                if isinstance(a, Exception):
+                    raise a
+                return a
+            run = RunHandle(self.https(answer), {"run_id": "r1", "run_token": "t"})
+            with self.subTest(warning), warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                self.assertIsNone(run.complete("call-1", **DONE))
+                said = [str(w.message) for w in caught if "recorded" in str(w.message)]
+                if warning:
+                    self.assertEqual(len(said), 1, said)
+                    self.assertRegex(said[0], warning)
+                else:
+                    self.assertEqual(said, [])
+
+    def test_a_signer_refusing_connections_records_nothing(self):
+        """A fresh client's hello that can't connect sent nothing: the write was not recorded, as the spec's "no signer
+        at the first connect" says, and no "may have been recorded"."""
+        with socket.socket() as s:   # a port nothing listens on
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        c = Client(f"http://127.0.0.1:{port}", timeout=2)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertIs(cm.exception.recorded, False)
+        self.assertNotIn(client.UNKNOWN, str(cm.exception))
+        # Windows retries a refused loopback connect for about 2 s: the connect times out instead
+        with self.assertWarnsRegex(UserWarning, r"the result of call-1 was not recorded: (lost the connection|could not "
+                                                r"connect|no answer from the signer within)"):
+            self.assertIsNone(RunHandle(c, {"run_id": "r1", "run_token": "t"}).complete("call-1", **DONE))
+
+    def test_a_signer_gone_after_the_hello_records_nothing_it_refused(self):
+        """Once the hello is answered, a connect the signer refuses still sends nothing: not recorded, not "may have
+        been". The signer keeps connections alive and closes idle ones, as the real one does: the kept connection it
+        closed is not written into."""
+        import http.server
+
+        class Signer(http.server.BaseHTTPRequestHandler):
+            protocol_version, timeout = "HTTP/1.1", 0.1   # keep-alive; an idle connection is closed after 0.1 s
+
+            def do_POST(self):
+                frame = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                body = json.dumps(HELLO if frame["method"] == "hello" else {}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Signer)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        c = Client(f"http://127.0.0.1:{srv.server_address[1]}", timeout=2)
+        self.addCleanup(c.close)
+        c.status()   # the hello is cached
+        srv.shutdown()
+        srv.server_close()   # gone: every connect is refused
+        conn, = c._https.conns   # wait for the signer to close the kept connection
+        deadline = time.monotonic() + 5
+        while not client._readable(conn.sock) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertIs(cm.exception.recorded, False)
+        self.assertNotIn(client.UNKNOWN, str(cm.exception))
+        # Windows retries a refused loopback connect for about 2 s: the connect times out instead
+        with self.assertWarnsRegex(UserWarning, r"the result of call-1 was not recorded: (lost the connection|could not "
+                                                r"connect|no answer from the signer within)"):
+            self.assertIsNone(RunHandle(c, {"run_id": "r1", "run_token": "t"}).complete("call-1", **DONE))
+
+    def test_a_connect_that_times_out_after_the_hello_records_nothing(self):
+        """A connect (or TLS handshake) that times out sent nothing: not recorded, not "may have been"."""
+        c = Client("http://127.0.0.1:9", timeout=1)
+        self.addCleanup(c.close)
+        c._https.hello = HELLO   # the hello is cached
+        with mock.patch("http.client.HTTPConnection.connect", side_effect=socket.timeout("timed out")):
+            with self.assertRaises(client.SignerUnavailable) as cm:
+                c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertIs(cm.exception.recorded, False)
+        self.assertNotIn(client.UNKNOWN, str(cm.exception))
+
+    def test_a_connection_lost_after_the_request_went_out_may_have_recorded_it(self):
+        """A keep-alive signer that answers the hello, then reads the write and closes without answering: the write went
+        out, so it may have been recorded (`recorded` None, and the message says so)."""
+        import http.server
+
+        class Signer(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"   # keep-alive
+
+            def do_POST(self):
+                frame = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if frame["method"] != "hello":
+                    self.close_connection = True   # read, never answered
+                    return
+                body = json.dumps(HELLO).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Signer)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        c = Client(f"http://127.0.0.1:{srv.server_address[1]}", timeout=2)
+        self.addCleanup(c.close)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertIsNone(cm.exception.recorded)
+        self.assertTrue(str(cm.exception).endswith(client.UNKNOWN), str(cm.exception))
+
+    def test_a_write_that_times_out_after_it_went_out_may_have_recorded_it(self):
+        """A keep-alive signer that answers the hello, then reads the write and answers only after the client's timeout:
+        the write went out, so it may have been recorded (`recorded` None, and the message says so)."""
+        import http.server
+
+        class Signer(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"   # keep-alive
+
+            def do_POST(self):
+                frame = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if frame["method"] != "hello":
+                    time.sleep(1.5)   # read, answered too late
+                body = json.dumps(HELLO if frame["method"] == "hello" else {}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Signer)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        c = Client(f"http://127.0.0.1:{srv.server_address[1]}", timeout=0.5)
+        self.addCleanup(c.close)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertIsNone(cm.exception.recorded)
+        self.assertTrue(str(cm.exception).endswith(client.UNKNOWN), str(cm.exception))
+
+    def test_approval_consumes_reason_has_no_unknown_sentence(self):
+        """approval_consume's reason goes to the model: no "may have been recorded" sentence; `recorded` stays None."""
+        def answer(frame):
+            raise client._ConnectionLost("reset")
+        run = RunHandle(self.https(answer), {"run_id": "r1", "run_token": "t"})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r = run.approval_consume("c1", "Bash", {"command": "ls"})
+        self.assertEqual((r["ok"], r["reason"]), (False, "approval_consume failed: lost the connection to the signer 3 "
+                                                         "times (last: reset)"))
+        self.assertFalse([w for w in caught if "may have been recorded" in str(w.message)])
+
+    def test_decides_outage_path_is_worded_as_before(self):
+        """A decide with no answer may have been recorded (`recorded` None), but its fail mode's warning and reason,
+        which integrations hand the agent, carry no "may have been recorded" sentence."""
+        def answer(frame):
+            raise client._ConnectionLost("reset")
+        run = RunHandle(self.https(answer), {"run_id": "r1", "run_token": "t", "fail_modes": {"default": "closed"}})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            d = run.decide("c1", "Bash", {"command": "ls"})
+        self.assertEqual((d["decision"], d["reason"]), ("deny", "signer unavailable: lost the connection to the signer "
+                                                                "3 times (last: reset)"))
+        self.assertFalse([w for w in caught if "may have been recorded" in str(w.message)])
+
+    def test_only_a_write_is_left_unknown(self):
+        """`recorded` None means a write's unknown outcome only: a call that writes nothing is False."""
+        def answer(frame):
+            raise client._unanswered(1)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            self.https(answer).status({})
+        self.assertIs(cm.exception.recorded, False)
+        self.assertNotIn(client.UNKNOWN, str(cm.exception))
+
+    def test_an_error_code_this_client_doesnt_know_is_an_rpc_error(self):
+        """A newer signer can answer with an error code this client's ERROR_CODES lacks: the client raised
+        AssertionError, which callers that catch RPCError don't handle. It is an RPCError with that code; the signer's
+        own errors are still held to ERROR_CODES when they are sent."""
+        c = self.https(lambda frame: {"error": {"code": "a_newer_signers_code", "message": "no", "retry_after_ms": 5}})
+        with self.assertRaises(RPCError) as raised:
+            c.decide({**EVENT, "run_id": "r1", "tool_call_id": "c1", "args": {}})
+        self.assertEqual((raised.exception.code, raised.exception.retry_after_ms), ("a_newer_signers_code", 5))
+        with self.assertRaises(AssertionError):
+            RPCError("a_newer_signers_code", "no").wire()
+
     def test_a_runs_events_reach_an_https_signer_in_client_seq_order(self):
         arrived = collections.defaultdict(list)
 
@@ -471,9 +701,199 @@ class Transports(unittest.TestCase):
             c.close()
         self.assertEqual([conn.close.call_count for conn in conns], [1, 1])
 
+    def test_retry_after_lost_connection_stops_at_call_timeout(self):
+        sent = []
+
+        def answer(frame):
+            sent.append(frame)
+            time.sleep(0.18)
+            raise client._ConnectionLost("reset")
+        c = self.https(answer, timeout=0.1)
+        t = time.monotonic()
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 0\.1s"):
+            c.decide({**EVENT, "tool_call_id": "c1", "args": {}})
+        self.assertEqual(len(sent), 1)
+        self.assertLess(time.monotonic() - t, 0.5)
+
+    def test_timed_out_call_before_first_try_uses_its_client_seq(self):
+        seen = []
+        c = self.https(lambda frame: seen.append(frame["client_seq"]) or {"ok": True}, timeout=0)
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 0s"):
+            c.decide({**EVENT, "tool_call_id": "c1", "args": {}})
+        c.timeout = 2
+        c.decide({**EVENT, "tool_call_id": "c2", "args": {}})
+        self.assertEqual(seen, [1])
+
+    def test_slow_http_hello_bounds_call_and_reports_call_timeout(self):
+        calls, done = [], threading.Event()
+        self.addCleanup(done.set)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if req["method"] == "hello":
+                    done.wait(0.5)
+                    body = json.dumps(HELLO).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    calls.append(req["method"])
+                    done.wait(5)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        c = Client(f"http://127.0.0.1:{srv.server_address[1]}", timeout=2.0)
+        self.addCleanup(c.close)
+        t = time.monotonic()
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 2s"):
+            c.status()
+        self.assertLess(time.monotonic() - t, 2.5)
+        self.assertEqual(calls, ["status"])
+
+    def test_slow_dial_does_not_send_past_deadline(self):
+        from tracekit.identity.token import DevToken
+        from tracekit.signer.rpc_schema import REQUESTS
+        from tracekit.transport.tcp_dev import TcpDevServer
+        seen = []
+        ep = os.path.join(tempfile.mkdtemp(), "ep.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(ep), True)
+        srv = TcpDevServer(ep, DevToken("dev", [*REQUESTS, "hello"], ttl_s=600),
+                           lambda _, f: HELLO if f["method"] == "hello"
+                           else seen.append(f.get("client_seq")) or {"ok": True})
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        port = json.load(open(ep))["port"]
+        real_connect = client.connect
+
+        def slow_connect(path, timeout=client.CONNECT_TIMEOUT_S, token=None):
+            out = real_connect(path, timeout=timeout, token=token)
+            time.sleep(0.25)
+            return out
+
+        c = Client(f"tcp://127.0.0.1:{port}", timeout=0.15, token=srv.token.secret)
+        self.addCleanup(c.close)
+        with mock.patch.object(client, "connect", side_effect=slow_connect):
+            with self.assertRaisesRegex(client.SignerUnavailable, r"within 0\.15s"):
+                c.decide({**EVENT, "tool_call_id": "c1", "args": {}})
+        self.assertIsNotNone(c._conn)
+        self.assertEqual(list(c._conn.pending), [])
+        self.assertEqual(seen, [])
+        c.timeout = 2
+        c.decide({**EVENT, "tool_call_id": "c2", "args": {}})
+        self.assertEqual(seen, [1])
+
+    def _silent_tcp(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        self.addCleanup(srv.close)
+        held = []
+
+        def accept_all():
+            with contextlib.suppress(OSError):
+                while True:
+                    conn, _ = srv.accept()
+                    held.append(conn)
+        threading.Thread(target=accept_all, daemon=True).start()
+        self.addCleanup(lambda: [s.close() for s in held])
+        return f"tcp://127.0.0.1:{srv.getsockname()[1]}"
+
+    def test_stalled_tcp_connect_stops_within_call_timeout(self):
+        c = Client(self._silent_tcp(), timeout=0.12, token="0" * 32)
+        t = time.monotonic()
+        with self.assertRaises(client.SignerUnavailable):
+            c.status()
+        self.assertLess(time.monotonic() - t, 1.0)
+
+    def test_hung_tcp_signer_reports_signer_address_at_connect_timeout(self):
+        _assert_hung_connect_reports_address(self, self._silent_tcp(), token="0" * 32)
+
+    def test_parallel_tcp_calls_share_deadline_behind_dial(self):
+        _assert_parallel_calls_share_deadline(self, self._silent_tcp(), token="0" * 32)
+
+    def test_expired_deadline_in_send_does_not_format_negative_timeout(self):
+        c = Client("tcp://127.0.0.1:1", timeout=1, token="0" * 32)
+        self.addCleanup(c.close)
+        with self.assertRaisesRegex(client._TimeoutUnavailable, r"^no time left after waiting for another call$"):
+            c._send(
+                "decide",
+                {**EVENT, "request_id": "req-1", "tool_call_id": "c1", "args": {}},
+                1,
+                time.monotonic() - 0.3,
+            )
+        self.assertEqual(c._seqs.get("r1"), 1)
+
+
+def _assert_hung_connect_reports_address(test, addr, **kwargs):
+    c = Client(addr, timeout=5, **kwargs)
+    test.addCleanup(c.close)
+    errs = {}
+
+    def run(name, fn):
+        try:
+            fn()
+        except BaseException as e:
+            errs[name] = e
+
+    t = time.monotonic()
+    threads = [
+        threading.Thread(target=run, args=("status", lambda: c.status({}))),
+        threading.Thread(target=run, args=("wait", lambda: c.approval_wait(
+            {"run_id": "r1", "run_token": "t", "approval_id": "a1", "timeout_ms": 0}))),
+    ]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(6)
+    test.assertLess(time.monotonic() - t, 3.5)
+    for name in ("status", "wait"):
+        e = errs.get(name)
+        test.assertIsInstance(e, client.SignerUnavailable, f"{name}: {e!r}")
+        test.assertRegex(str(e), rf"^no signer answering at {re.escape(addr)}: timed out$")
+
+
+def _assert_parallel_calls_share_deadline(test, addr, **kwargs):
+    c = Client(addr, timeout=1, **kwargs)
+    test.addCleanup(c.close)
+    res = [None] * 4
+    start = time.monotonic()
+
+    def run(i):
+        try:
+            c.status({})
+        except BaseException as e:
+            res[i] = (e, time.monotonic() - start)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(6)
+    for i, item in enumerate(res):
+        test.assertIsNotNone(item, f"thread {i} did not finish")
+        e, elapsed = item
+        test.assertIsInstance(e, client.SignerUnavailable, f"thread {i}: {e!r}")
+        test.assertRegex(str(e), r"within 1s")
+        test.assertLess(elapsed, 1.5, f"thread {i} took {elapsed:.2f}s")
+
 
 HELLO = {"proto": [RPC_VERSION, RPC_VERSION], "version": __version__, "pid": os.getpid()}
 EVENT = {"run_id": "r1", "run_token": "t", "tool": "Bash", "args_source": "parsed"}
+LIMIT = {"error": {"code": "quota_exceeded", "message": "event rate limit", "retry_after_ms": 5}}
+OUTAGE = {"error": {"code": "unavailable", "message": "storage refused writes"}}
+REUSED = {"error": {"code": "client_seq_reused", "message": "s/0"}}
+MISMATCH = {"error": {"code": "args_mismatch", "message": "no"}}
+DONE = {"decision_id": "d1", "args_digest": "sha256:" + "0" * 64}
 
 
 class RunExit(unittest.TestCase):
@@ -487,6 +907,14 @@ class RunExit(unittest.TestCase):
         with self.assertWarnsRegex(UserWarning, "run r was not closed: the signer can't be reached .* idle timeout"):
             with self.handle():
                 pass
+
+    def test_a_close_that_may_have_been_recorded_says_so(self):
+        e = client._unanswered(1)   # went out, no answer: `recorded` None
+        with mock.patch.object(Client, "call", side_effect=e), self.assertWarns(UserWarning) as cm:
+            with self.handle():
+                pass
+        self.assertRegex(str(cm.warning), r"^tracekit: run r may not have been closed: the signer can't be reached "
+                                          r"\(no answer .*\); it closes the run after its idle timeout$")
 
     def test_the_blocks_exception_is_never_masked(self):
         for refusal in (None, RPCError("run_closed", "r")):
@@ -542,6 +970,68 @@ class FakeSigners(unittest.TestCase):
         threading.Thread(target=serve, daemon=True).start()
         self.addCleanup(lambda: [s.close() for s in held + [srv]])
         return frames
+
+    def drops_the_first(self, retry=None):
+        """A signer that answers hello, reads each request and shuts its connection down; then it stops listening
+        (`retry` None) or answers the request's retry with `retry`. -> the requests it read."""
+        srv, frames, held = socket.socket(socket.AF_UNIX), [], []
+        srv.bind(self.path)
+        srv.listen()
+
+        def serve():
+            with contextlib.suppress(OSError):   # closed by the cleanup, or by itself
+                while True:
+                    conn, _ = srv.accept()
+                    held.append(conn)
+                    rfile = conn.makefile("rb")
+                    rfile.readline()
+                    conn.sendall((json.dumps(HELLO) + "\n").encode())
+                    for line in iter(rfile.readline, b""):
+                        frames.append(json.loads(line))
+                        if [f["request_id"] for f in frames].count(frames[-1]["request_id"]) > 1:
+                            conn.sendall((json.dumps(retry) + "\n").encode())
+                            continue
+                        if retry is None:
+                            srv.close()
+                        conn.shutdown(socket.SHUT_RDWR)   # close() alone: rfile keeps the descriptor open, no drop seen
+                        break
+        threading.Thread(target=serve, daemon=True).start()
+        self.addCleanup(lambda: [s.close() for s in held + [srv]])
+        return frames
+
+    def test_a_signer_gone_after_reading_complete_may_have_recorded_it(self):
+        self.drops_the_first()
+        run = RunHandle(Client(self.path, timeout=2), {"run_id": "r1", "run_token": "t"})
+        with self.assertWarnsRegex(UserWarning, r"the result of call-1 may not have been recorded \(no signer answering "
+                                                r"at .*\)\. Once the run closes, its bundle has call-1's tool.result if "
+                                                r"it was, or a decided_not_completed gap if it wasn't\.$"):
+            self.assertIsNone(run.complete("call-1", **DONE))
+
+    def test_a_retry_refused_as_already_recorded_after_a_drop_was_recorded(self):
+        frames = self.drops_the_first(REUSED)
+        c = Client(self.path, timeout=2)
+        run = RunHandle(c, {"run_id": "r1", "run_token": "t"})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.assertIsNone(run.complete("call-1", **DONE))
+        self.assertEqual([str(w.message) for w in caught if "recorded" in str(w.message)], [])
+        with self.assertRaises(RPCError) as cm:   # the next event: its first try dropped, its retry refused
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-2", "status": "ok", **DONE})
+        self.assertEqual((cm.exception.code, cm.exception.recorded), ("client_seq_reused", True))
+        self.assertEqual([(f["tool_call_id"], f["client_seq"]) for f in frames],   # each request sent twice, as it was
+                         [("call-1", 0), ("call-1", 0), ("call-2", 1), ("call-2", 1)])
+
+    def test_a_write_that_times_out_after_it_went_out_may_have_recorded_it(self):
+        """A signer that reads complete and never answers: the write went out, so it may have been recorded (`recorded`
+        None, and the message says so)."""
+        frames = self.stalled()
+        c = Client(self.path, timeout=0.5)
+        self.addCleanup(c.close)
+        with self.assertRaises(client.SignerUnavailable) as cm:
+            c.complete({"run_id": "r1", "run_token": "t", "tool_call_id": "call-1", "status": "ok", **DONE})
+        self.assertEqual([f["tool_call_id"] for f in frames], ["call-1"])
+        self.assertIsNone(cm.exception.recorded)
+        self.assertTrue(str(cm.exception).endswith(client.UNKNOWN), str(cm.exception))
 
     def test_a_request_that_is_not_json_takes_no_answer_and_no_client_seq(self):
         seen = []
@@ -605,9 +1095,96 @@ class FakeSigners(unittest.TestCase):
     def test_a_long_poll_without_an_answer_is_not_sent_again(self):
         frames = self.stalled()
         c = Client(self.path, timeout=0.3)
-        with self.assertRaises(client.SignerUnavailable):
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 0\.3s"):
             c.approval_wait({"run_id": "r1", "run_token": "t", "approval_id": "a1", "timeout_ms": 0})
         self.assertEqual([f["method"] for f in frames], ["approval_wait"])
+
+    def test_retry_after_dropped_unix_connection_stops_on_slow_reconnect_hello(self):
+        srv, frames, held, done = socket.socket(socket.AF_UNIX), [], [], threading.Event()
+        srv.bind(self.path)
+        srv.listen()
+        self.addCleanup(lambda: [s.close() for s in held + [srv]])
+
+        def serve():
+            try:
+                for idx in (1, 2):
+                    conn, _ = srv.accept()
+                    held.append(conn)
+                    with conn.makefile("rb") as rfile:
+                        rfile.readline()
+                        if idx == 2:
+                            time.sleep(1.5)
+                        conn.sendall((json.dumps(HELLO) + "\n").encode())
+                        conn.settimeout(0.2)
+                        line = rfile.readline()
+                        if line:
+                            frames.append(json.loads(line))
+                        if idx == 1:
+                            conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            finally:
+                done.set()
+        threading.Thread(target=serve, daemon=True).start()
+        c = Client(self.path, timeout=0.5)
+        self.addCleanup(c.close)
+        t = time.monotonic()
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 0\.5s"):
+            c.status({})
+        self.assertLess(time.monotonic() - t, 1.0)
+        done.wait(3)
+        self.assertEqual(len(frames), 1)
+
+    def test_reconnect_after_slow_hello_bounds_answer_wait(self):
+        srv, held, stop = socket.socket(socket.AF_UNIX), [], threading.Event()
+        srv.bind(self.path)
+        srv.listen()
+        self.addCleanup(lambda: [s.close() for s in held + [srv]])
+
+        def serve():
+            with contextlib.suppress(OSError):
+                for idx in (1, 2):
+                    conn, _ = srv.accept()
+                    held.append(conn)
+                    with conn.makefile("rb") as rfile:
+                        rfile.readline()
+                        if idx == 2:
+                            stop.wait(0.35)
+                        conn.sendall((json.dumps(HELLO) + "\n").encode())
+                        rfile.readline()
+                        if idx == 1:
+                            conn.shutdown(socket.SHUT_RDWR)
+                        else:
+                            stop.wait(5)
+        threading.Thread(target=serve, daemon=True).start()
+        c = Client(self.path, timeout=0.5)
+        self.addCleanup(c.close)
+        self.addCleanup(stop.set)
+        t = time.monotonic()
+        with self.assertRaisesRegex(client.SignerUnavailable, r"within 0\.5s"):
+            c.status({})
+        self.assertLess(time.monotonic() - t, 0.75)
+
+    def _silent_unix(self):
+        srv, held, stop = socket.socket(socket.AF_UNIX), [], threading.Event()
+        srv.bind(self.path)
+        srv.listen(8)
+        self.addCleanup(lambda: [s.close() for s in held + [srv]])
+        self.addCleanup(stop.set)
+
+        def serve():
+            with contextlib.suppress(OSError):
+                while not stop.is_set():
+                    conn, _ = srv.accept()
+                    held.append(conn)
+        threading.Thread(target=serve, daemon=True).start()
+        return self.path
+
+    def test_hung_unix_signer_reports_signer_address_at_connect_timeout(self):
+        _assert_hung_connect_reports_address(self, self._silent_unix())
+
+    def test_parallel_unix_calls_share_deadline_behind_dial(self):
+        _assert_parallel_calls_share_deadline(self, self._silent_unix())
 
     def test_a_forked_child_does_not_inherit_a_held_lock(self):
         code = f"""if 1:

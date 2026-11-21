@@ -6,6 +6,8 @@ import time
 import timeit
 import unittest
 
+import pytest
+
 from tracekit import privacy
 
 SIZE = 256 * 1024
@@ -46,6 +48,7 @@ class RedactionRuntimeTests(unittest.TestCase):
     def test_every_pattern_has_adversarial_inputs(self):
         self.assertEqual({name for name, _ in privacy.SECRET_PATTERNS}, set(ADVERSARIAL))
 
+    @pytest.mark.serial
     def test_adversarial_inputs_redact_quickly(self):
         for name, prefixes in ADVERSARIAL.items():
             for prefix in prefixes:
@@ -84,6 +87,7 @@ class RedactionRuntimeTests(unittest.TestCase):
                 self.assertTrue(hit)
                 self.assertEqual(out, "connect [REDACTED:connection_string] now")
 
+    @pytest.mark.serial
     def test_long_scheme_run_before_url_is_fast_and_redacted(self):
         s = repeated("a-")[:-100] + "postgres://user:pass@host/db"
         self.assertLess(seconds(lambda: privacy.redact_text(s)), BOUND)
@@ -91,6 +95,7 @@ class RedactionRuntimeTests(unittest.TestCase):
         self.assertTrue(hit)
         self.assertNotIn("pass@host", out)
 
+    @pytest.mark.serial
     def test_assignment_and_dotenv_redaction_fast(self):
         for s in (repeated("aws_secret_access_key"), repeated("password"), repeated("\n"), repeated(" \n"),
                   repeated("export ")):
@@ -103,6 +108,14 @@ class RedactionRuntimeTests(unittest.TestCase):
         self.assertIn("[REDACTED:dotenv]", rec["command"]["value"])
         plain = privacy.tool_input("Bash", {"command": "FOO=bar make test"})
         self.assertEqual(plain["command"]["value"], "FOO=bar make test")
+        # a call's several commands or files (Cline's run_commands) are recorded as one is: in clear, each redacted
+        rec = privacy.tool_input("Bash", {"commands": ["ls", "cat >> .env <<EOF\nDB_HOST=internal.example\nEOF"]})
+        self.assertEqual(rec["commands"]["value"][0], "ls")
+        self.assertNotIn("internal.example", rec["commands"]["value"][1])
+        self.assertIn("[REDACTED:dotenv]", rec["commands"]["value"][1])
+        rec = privacy.tool_input("Read", {"file_path": "a", "paths": ["a", ".env"], "note": "DB_HOST=internal.example"})
+        self.assertEqual(rec["paths"]["value"], ["a", ".env"])
+        self.assertNotIn("value", rec["note"])   # hashed, as any other field
 
     def test_action_fields_mentioning_dotenv_are_recorded_in_full(self):
         rec = privacy.tool_input("Bash", {"command": "API_TOKEN=abcd1234 DEBUG=1 cp .env .env.bak"})

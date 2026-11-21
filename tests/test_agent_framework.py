@@ -443,6 +443,7 @@ class Paths(unittest.TestCase):
             return "README.md"
         self.addCleanup(setattr, ClientSession, "call_tool", ClientSession.call_tool)
         self.addCleanup(setattr, ClientSession, "get_prompt", ClientSession.get_prompt)
+        self.addCleanup(setattr, ClientSession, "read_resource", ClientSession.read_resource)
         self.addCleanup(setattr, ClientSession, "initialize", ClientSession.initialize)
         for name in ("list_tools", "list_resources", "list_prompts"):
             if hasattr(ClientSession, name):
@@ -456,6 +457,7 @@ class Paths(unittest.TestCase):
                     return (await a.run("list them")).text
         with mock.patch.object(ClientSession, "call_tool", ClientSession.call_tool), \
                 mock.patch.object(ClientSession, "get_prompt", ClientSession.get_prompt), \
+                mock.patch.object(ClientSession, "read_resource", ClientSession.read_resource), \
                 mock.patch("tracekit.integrations.mcp.TracekitSession") as gate:
             autowire._mcp(mock.Mock())   # what instrument() wires: every ClientSession decides its calls
             for r, runs in ((run(), True), (run("deny", ["D1"]), False)):
@@ -585,7 +587,11 @@ class RealSigner(unittest.TestCase):
 @unittest.skipUnless(HAVE, "agent_framework not installed")
 class VersionCheck(VersionCheckCases, unittest.TestCase):
     module, inside = "agent_framework", "1.22.0"
-    message = "Agent Framework 0.0.1 is wired but untested; Tracekit is tested with agent-framework-core>=1.22,<1.23"
+    message = "Agent Framework 0.0.1 is wired but untested; Tracekit is tested with agent-framework-core>=1.22,<1.27"
+
+    def test_the_tested_range_ends_after_1_26(self):
+        self.assertEqual(self.warnings_for("1.26.3"), [])
+        self.assertEqual(len(self.warnings_for("1.27.0")), 1)
 
 
 if __name__ == "__main__":

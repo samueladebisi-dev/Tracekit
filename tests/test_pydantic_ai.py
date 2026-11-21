@@ -11,6 +11,7 @@ from unittest import mock
 import adapter_contract as ac
 import test_gateway
 import test_said as ts
+from factories import VersionCheckCases
 
 HAVE = importlib.util.find_spec("pydantic_ai") is not None
 OPENAI = HAVE and importlib.util.find_spec("openai") is not None
@@ -46,13 +47,18 @@ def run(decision="allow", rule_ids=(), consume=True, state="approved", **more):
     return ts.vault(r, on=False)
 
 
+def retried(p):
+    """A retry prompt: a RetryPromptPart, or from Pydantic AI 2.71 a ToolReturnPart whose outcome is "retried"."""
+    return isinstance(p, RetryPromptPart) or getattr(p, "outcome", None) == "retried"
+
+
 def agent(r, tool, args=None):
     """An agent whose model calls `tool` once (with `args`, default {"account": "ACC-9"}) and then answers with what
     the tool returned, or with the retry prompt it was given."""
     def model(messages, info):
         parts = [p for m in messages for p in m.parts]
         back = [p for p in parts if isinstance(p, (ToolReturnPart, RetryPromptPart))]
-        if not back or isinstance(back[-1], RetryPromptPart) and len(back) < 2:
+        if not back or retried(back[-1]) and len(back) < 2:
             return ModelResponse(parts=[ToolCallPart("close_account", {"account": "ACC-9"} if args is None else args,
                                                      f"call-{len(back) + 1}")])
         return ModelResponse(parts=[TextPart(str(back[-1].content))])
@@ -336,6 +342,8 @@ class Setup(unittest.TestCase):
         from mcp import ClientSession
         original = mock.AsyncMock(return_value="result")
         self.addCleanup(setattr, ClientSession, "call_tool", ClientSession.call_tool)
+        self.addCleanup(setattr, ClientSession, "get_prompt", ClientSession.get_prompt)
+        self.addCleanup(setattr, ClientSession, "read_resource", ClientSession.read_resource)
         self.addCleanup(setattr, ClientSession, "initialize", ClientSession.initialize)
         for name in ("list_tools", "list_resources", "list_prompts"):
             if hasattr(ClientSession, name):
@@ -443,7 +451,7 @@ class Said(unittest.TestCase):
         """Pydantic AI asks the model again without running it or any hook: recorded, it would read as a call that
         ran with no decision (reconcile.hook_missing)."""
         def model(messages, info):
-            if any(isinstance(p, RetryPromptPart) for m in messages for p in m.parts):
+            if any(retried(p) for m in messages for p in m.parts):
                 return ModelResponse(parts=[TextPart("done")])
             return ModelResponse(parts=[TextPart("Closing."), ToolCallPart("close_account", {"acct": 1}, "c-2")])
 
@@ -585,6 +593,16 @@ class VerifiedToolResults(test_gateway.Gateway):
                                                                               message_history=first.all_messages())
         self.assertEqual((first.output, out.output), ("HI", "follow-up answer"))
         self.assertEqual(self.mismatches(r.run_id), [])
+
+
+@unittest.skipUnless(HAVE, "pydantic_ai not installed")
+class VersionCheck(VersionCheckCases, unittest.TestCase):
+    module, inside = "pydantic_ai", "2.57.0"
+    message = "Pydantic AI 0.0.1 is wired but untested; Tracekit is tested with pydantic-ai-slim>=2.57,<2.72"
+
+    def test_the_tested_range_ends_after_2_71(self):
+        self.assertEqual(self.warnings_for("2.71.4"), [])
+        self.assertEqual(len(self.warnings_for("2.72.0")), 1)
 
 
 if __name__ == "__main__":

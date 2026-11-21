@@ -53,7 +53,10 @@ await client.close();                                     // waits for what is i
 
 - **Signer:** `$TRACEKIT_SIGNER` names a Unix socket, `tcp://127.0.0.1:port` (with `$TRACEKIT_SIGNER_TOKEN`; both sides
   prove they hold it, it never goes on the wire) or `https://host:port` (`$TRACEKIT_SIGNER_TOKEN_FILE`: a bearer token
-  re-read per call; `$TRACEKIT_SIGNER_CERT`/`_KEY`: mTLS; `$TRACEKIT_SIGNER_CA`: the signer's CA). In system mode the
+  re-read per call, else `$TRACEKIT_API_KEY`: the token itself; `$TRACEKIT_SIGNER_CERT`/`_KEY`: mTLS;
+  `$TRACEKIT_SIGNER_CA`: the signer's CA). An event call (decide, complete, observe, state_write, model_event) the
+  signer refuses with a rate limit or an outage is sent again within the call's timeout
+  ([remote clients](../../docs/remote-ingest.md#calling-the-signer-over-http)). In system mode the
   signer named by the root-owned `/etc/tracekit/client.json` is used and a different `$TRACEKIT_SIGNER` is refused.
   Otherwise the same-user dev signer is found, or started with `tracekit up --json`: `$TRACEKIT_PYTHON -m tracekit` if
   set, else a pip-installed `tracekit` on PATH, else the Python bundled in this platform's
@@ -61,8 +64,10 @@ await client.close();                                     // waits for what is i
   same command.
 - **Protocol:** `hello` first; a signer that does not speak this client's RPC version is refused with `Incompatible`.
   Requests are validated against the RPC schemas before they are sent, pipelined on one connection and answered in
-  order; a call whose connection drops is resent with the same `request_id`. Each handle's events carry the client's
-  `stream` and a `client_seq` per run.
+  order; a call whose connection drops is resent with the same `request_id`. A write call's error has `recorded`:
+  `false` when it was not recorded, `null` when it went out with no answer, or the signer answered `unavailable`, and
+  may have been, `true` when a retry was refused as already recorded. Each handle's events carry the client's `stream`
+  and a `client_seq` per run.
 - **Fail modes:** only when the signer cannot be reached does `decide` return the run's fail mode for the tool class
   (`fields.tool_class_hint`, from `register_run`'s `fail_modes`, default closed) with `unavailable: true`. A refusal
   from the signer rejects with `RPCError`, never an allow.
